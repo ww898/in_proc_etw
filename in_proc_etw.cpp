@@ -9,6 +9,7 @@
 #include <memory>
 #include <iostream>
 #include <iomanip>
+#include <sstream>
 
 #include <evntprov.h>
 #include <evntrace.h>
@@ -468,6 +469,31 @@ GUID const & get_provider_guid(REGHANDLE const rh)
     }
 }
 
+std::wstring create_etw_file()
+{
+    wchar_t buf[MAX_LOGFILE_PATH_LEN];
+    auto buf_len = GetTempPathW(_countof(buf), buf);
+    if (!buf_len)
+    {
+        std::wcerr << L"ERROR in GetTempPathW: " << std::dec << GetLastError() << std::endl;
+        std::abort();
+    }
+
+    std::wstringstream out;
+    out << buf;
+
+    if (buf[buf_len - 1] != L'\\')
+        out << L'\\';
+
+    out << L"in_proc_etw_" << std::dec << GetCurrentProcessId() << L".etl";
+    if (out.fail())
+    {
+        std::wcerr << L"ERROR in std::wstringstream" << std::endl;
+        std::abort();
+    }
+    return out.str();
+}
+
 // {83C2C192-2E19-44B2-8D8E-3167AFFBAA3F}
 static const GUID session_guid =
 { 0x83c2c192, 0x2e19, 0x44b2, { 0x8d, 0x8e, 0x31, 0x67, 0xaf, 0xfb, 0xaa, 0x3f } };
@@ -476,110 +502,149 @@ static auto const name = L"QQQ";
 
 void wmain()
 {
-    ULONG code;
-
-    REGHANDLE rhs[providers_count];
-    for (size_t n = 0; n < providers_count; ++n)
+    try
     {
-        std::wcout << L"EventRegister #" << std::dec << n << std::endl;
-        if (code = EventRegister(providers[n].guid, providers[n].callback, providers[n].context, &rhs[n]), ERROR_SUCCESS != code)
+        ULONG code;
+
+        REGHANDLE rhs[providers_count];
+        for (size_t n = 0; n < providers_count; ++n)
         {
-            std::wcerr << L"ERROR in EventRegister: " << std::dec << code << std::endl;
+            std::wcout << L"EventRegister #" << std::dec << n << std::endl;
+            if (code = EventRegister(providers[n].guid, providers[n].callback, providers[n].context, &rhs[n]), ERROR_SUCCESS != code)
+            {
+                std::wcerr << L"ERROR in EventRegister: " << std::dec << code << std::endl;
+                std::abort();
+            }
+        }
+
+        std::wcout << L"StartTraceW" << std::endl;
+        TRACEHANDLE th;
+        ULONG const prop_size = sizeof(EVENT_TRACE_PROPERTIES) +
+            MAX_SESSION_NAME_LEN * sizeof(wchar_t) +
+            MAX_LOGFILE_PATH_LEN * sizeof(wchar_t);
+        auto const buf = std::make_unique<uint8_t[]>(prop_size);
+        memset(buf.get(), 0, prop_size);
+        auto const prop = reinterpret_cast<EVENT_TRACE_PROPERTIES *>(buf.get());
+        prop->Wnode.BufferSize = prop_size;
+        prop->Wnode.Guid = session_guid;
+        prop->Wnode.ClientContext = 1;
+        prop->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+        prop->BufferSize = 4; // in Kb
+        prop->MinimumBuffers = 1;
+        prop->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+        prop->LogFileMode = EVENT_TRACE_PRIVATE_LOGGER_MODE | EVENT_TRACE_PRIVATE_IN_PROC;
+        prop->LogFileNameOffset = sizeof(EVENT_TRACE_PROPERTIES) + MAX_SESSION_NAME_LEN * sizeof(wchar_t);
+
+        // Note: See https://msdn.microsoft.com/en-us/library/windows/desktop/dd392330.aspx
+        //       Windows 7 and Windows Server 2008 R2
+        //
+        //       The following features were added in this release:
+        //
+        //       The ability to specify the EVENT_TRACE_BUFFERING_MODE or EVENT_TRACE_FILE_MODE_NEWFILE logging mode
+        //       with the EVENT_TRACE_PRIVATE_LOGGER_MODE logging mode (see Logging Mode Constants).
+        if (IsWindows7OrGreater())
+        {
+            prop->LogFileMode |= EVENT_TRACE_BUFFERING_MODE;
+            std::wcout << L"use cyclic buffer" << std::endl;
+        }
+        else
+        {
+            auto const file_src = create_etw_file();
+            auto const file_dst = reinterpret_cast<wchar_t *>(buf.get() + prop->LogFileNameOffset);
+            auto const err = wcscpy_s(file_dst, MAX_LOGFILE_PATH_LEN, file_src.c_str());
+            if (err)
+            {
+                std::wcerr << L"ERROR in wcscpy_s: " << std::dec << err << std::endl;
+                std::abort();
+            }
+            std::wcout << L"use file: " << file_src << std::endl;
+        }
+
+        if (code = StartTraceW(&th, name, prop), ERROR_SUCCESS != code)
+        {
+            std::wcerr << L"ERROR in StartTraceW: " << std::dec << code << std::endl;
             std::abort();
         }
-    }
 
-    std::wcout << L"StartTraceW" << std::endl;
-    TRACEHANDLE th;
-    ULONG const prop_size = sizeof(EVENT_TRACE_PROPERTIES) +
-        MAX_SESSION_NAME_LEN * sizeof(wchar_t) +
-        MAX_LOGFILE_PATH_LEN * sizeof(wchar_t);
-    auto const buf = std::make_unique<uint8_t[]>(prop_size);
-    memset(buf.get(), 0, prop_size);
-    auto const prop = reinterpret_cast<EVENT_TRACE_PROPERTIES *>(buf.get());
-    prop->Wnode.BufferSize = prop_size;
-    prop->Wnode.Guid = session_guid;
-    prop->Wnode.ClientContext = 1;
-    prop->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-    prop->BufferSize = 4; // in Kb
-    prop->MinimumBuffers = 1;
-    prop->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
-    prop->LogFileMode = EVENT_TRACE_BUFFERING_MODE | EVENT_TRACE_PRIVATE_LOGGER_MODE | EVENT_TRACE_PRIVATE_IN_PROC;
-    prop->LogFileNameOffset = sizeof(EVENT_TRACE_PROPERTIES) + MAX_SESSION_NAME_LEN * sizeof(wchar_t);
-    if (code = StartTraceW(&th, name, prop), ERROR_SUCCESS != code)
+        for (size_t n = 0; n < providers_count; ++n)
+        {
+            auto const is_active_before = EventProviderEnabled(rhs[n], WINEVENT_LEVEL_INFO, 0);
+            std::wcout << L"EventProviderEnabled #"<< std::dec << n << L": " << static_cast<unsigned>(is_active_before) << std::endl;
+        }
+
+        for (size_t n = 0; n < providers_count; ++n)
+        {
+            std::wcout << L"EnableTraceEx #" << std::dec << n << std::endl;
+            if (code = EnableTraceEx(providers[n].guid, nullptr, th, true, TRACE_LEVEL_INFORMATION, 0, 0, 0, nullptr), ERROR_SUCCESS != code)
+            {
+                std::wcerr << L"ERROR in EnableTraceEx: " << std::dec << code << std::endl;
+                std::abort();
+            }
+        }
+
+        for (size_t n = 0; n < providers_count; ++n)
+        {
+            auto const is_active_after = EventProviderEnabled(rhs[n], WINEVENT_LEVEL_INFO, 0);
+            std::wcout << L"EventProviderEnabled #"<< std::dec << n << L": " << static_cast<unsigned>(is_active_after) << std::endl;
+        }
+
+        for (size_t n = 0; n < providers_count; ++n)
+        {
+            std::wcout << L"EventWrite #" << std::dec << n << std::endl;
+            EVENT_DESCRIPTOR ed;
+            memset(&ed, 0, sizeof(ed));
+            ed.Id = 12345;
+            ed.Version = 1;
+            ed.Opcode = 20;
+            EVENT_DATA_DESCRIPTOR edd;
+            memset(&edd, 0, sizeof(edd));
+            static uint64_t const payload = 0xFEDCBA9876543210;
+            edd.Size = sizeof(payload);
+            edd.Ptr = reinterpret_cast<ULONGLONG>(&payload);
+            if (code = EventWrite(rhs[n], &ed, 1, &edd), ERROR_SUCCESS != code)
+            {
+                std::wcerr << L"ERROR in EventWrite: " << std::dec << code << std::endl;
+                std::abort();
+            }
+        }
+
+        std::wcout << L"StopTraceW" << std::endl;
+        if (code = StopTraceW(th, name, prop), ERROR_SUCCESS != code)
+        {
+            std::wcerr << L"ERROR in StopTraceW: " << std::dec << code << std::endl;
+            std::abort();
+        }
+
+        for (size_t n = 0; n < providers_count; ++n)
+        {
+            std::wcout << L"get_provider_guid #" << std::dec << n  << std::endl;
+            auto const & recovered_provider_guid = get_provider_guid(rhs[n]);
+            std::wcout << L"provider_guid #" << std::dec << n  << L": " << recovered_provider_guid << std::endl;
+            if (!IsEqualGUID(recovered_provider_guid, *providers[n].guid))
+            {
+                std::wcerr << L"ERROR in get_provider_guid" << std::endl;
+                std::abort();
+            }
+        }
+
+        for (size_t n = 0; n < providers_count; ++n)
+        {
+            std::wcout << L"EventUnregister #" << std::dec << n << std::endl;
+            if (code = EventUnregister(rhs[n]), ERROR_SUCCESS != code)
+            {
+                std::wcerr << L"ERROR in EventUnregister: " << std::dec << code << std::endl;
+                std::abort();
+            }
+        }
+    }
+    catch (std::exception const & ex)
     {
-        std::wcerr << L"ERROR in StartTraceW: " << std::dec << code << std::endl;
+        std::wcerr << L"ERROR:" << ex.what() << std::endl;
         std::abort();
     }
-
-    for (size_t n = 0; n < providers_count; ++n)
+    catch (...)
     {
-        auto const is_active_before = EventProviderEnabled(rhs[n], WINEVENT_LEVEL_INFO, 0);
-        std::wcout << L"EventProviderEnabled #"<< std::dec << n << L": " << static_cast<unsigned>(is_active_before) << std::endl;
-    }
-
-    for (size_t n = 0; n < providers_count; ++n)
-    {
-        std::wcout << L"EnableTraceEx #" << std::dec << n << std::endl;
-        if (code = EnableTraceEx(providers[n].guid, nullptr, th, true, TRACE_LEVEL_INFORMATION, 0, 0, 0, nullptr), ERROR_SUCCESS != code)
-        {
-            std::wcerr << L"ERROR in EnableTraceEx: " << std::dec << code << std::endl;
-            std::abort();
-        }
-    }
-
-    for (size_t n = 0; n < providers_count; ++n)
-    {
-        auto const is_active_after = EventProviderEnabled(rhs[n], WINEVENT_LEVEL_INFO, 0);
-        std::wcout << L"EventProviderEnabled #"<< std::dec << n << L": " << static_cast<unsigned>(is_active_after) << std::endl;
-    }
-
-    for (size_t n = 0; n < providers_count; ++n)
-    {
-        std::wcout << L"EventWrite #" << std::dec << n << std::endl;
-        EVENT_DESCRIPTOR ed;
-        memset(&ed, 0, sizeof(ed));
-        ed.Id = 12345;
-        ed.Version = 1;
-        ed.Opcode = 20;
-        EVENT_DATA_DESCRIPTOR edd;
-        memset(&edd, 0, sizeof(edd));
-        static uint64_t const payload = 0xFEDCBA9876543210;
-        edd.Size = sizeof(payload);
-        edd.Ptr = reinterpret_cast<ULONGLONG>(&payload);
-        if (code = EventWrite(rhs[n], &ed, 1, &edd), ERROR_SUCCESS != code)
-        {
-            std::wcerr << L"ERROR in EventWrite: " << std::dec << code << std::endl;
-            std::abort();
-        }
-    }
-
-    std::wcout << L"StopTraceW" << std::endl;
-    if (code = StopTraceW(th, name, prop), ERROR_SUCCESS != code)
-    {
-        std::wcerr << L"ERROR in StopTraceW: " << std::dec << code << std::endl;
+        std::wcerr << L"ERROR" << std::endl;
         std::abort();
-    }
-
-    for (size_t n = 0; n < providers_count; ++n)
-    {
-        std::wcout << L"get_provider_guid #" << std::dec << n  << std::endl;
-        auto const & recovered_provider_guid = get_provider_guid(rhs[n]);
-        std::wcout << L"provider_guid #" << std::dec << n  << L": " << recovered_provider_guid << std::endl;
-        if (!IsEqualGUID(recovered_provider_guid, *providers[n].guid))
-        {
-            std::wcerr << L"ERROR in get_provider_guid" << std::endl;
-            std::abort();
-        }
-    }
-
-    for (size_t n = 0; n < providers_count; ++n)
-    {
-        std::wcout << L"EventUnregister #" << std::dec << n << std::endl;
-        if (code = EventUnregister(rhs[n]), ERROR_SUCCESS != code)
-        {
-            std::wcerr << L"ERROR in EventUnregister: " << std::dec << code << std::endl;
-            std::abort();
-        }
     }
 }
