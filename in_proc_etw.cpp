@@ -453,15 +453,30 @@ EtwRegEntry_win_vista const * get_provider_entry_win_vista(REGHANDLE const rh)
     return static_cast<EtwRegEntry_win_vista const *>(entry);
 }
 
-GUID const & get_provider_guid(REGHANDLE const rh)
+void get_provider_info(REGHANDLE const rh, GUID const * & guid, PVOID & callback, PVOID & context)
 {
     std::wcout << L"Excavate provider GUID from REGHANDLE: " << std::hex << std::setw(2 * sizeof(rh)) << std::setfill(L'0') << rh << std::endl;
     if (IsWindows8OrGreater())
-        return get_provider_entry_win_8(rh)->ProviderId;
+    {
+        auto const entry = get_provider_entry_win_8(rh);
+        guid = &entry->ProviderId;
+        callback = entry->InternalCallback;
+        context = entry->CallbackContext;
+    }
     else if (IsWindows7OrGreater())
-        return get_provider_entry_win_7(rh)->ProviderId;
+    {
+        auto const entry = get_provider_entry_win_7(rh);
+        guid = &entry->ProviderId;
+        callback = entry->InternalCallback;
+        context = entry->Params->CallbackContext;
+    }
     else if (IsWindowsVistaOrGreater())
-        return get_provider_entry_win_vista(rh)->ProviderId;
+    {
+        auto const entry = get_provider_entry_win_vista(rh);
+        guid = &entry->ProviderId;
+        callback = entry->InternalCallback;
+        context = entry->Params->CallbackContext;
+    }
     else
     {
         std::wcerr << L"ERROR: unsupported OS" << std::endl;
@@ -544,11 +559,16 @@ void wmain()
         //       with the EVENT_TRACE_PRIVATE_LOGGER_MODE logging mode (see Logging Mode Constants).
         if (IsWindows7OrGreater())
         {
+            prop->BufferSize = 1; // in Kb
+            prop->MinimumBuffers = 1;
             prop->LogFileMode |= EVENT_TRACE_BUFFERING_MODE;
-            std::wcout << L"use cyclic buffer" << std::endl;
+            std::wcout << L"use circular buffer" << std::endl;
         }
         else
         {
+            prop->MaximumFileSize = 1;  // in Mb
+            prop->LogFileMode |= EVENT_TRACE_FILE_MODE_CIRCULAR;
+
             auto const file_src = create_etw_file();
             auto const file_dst = reinterpret_cast<wchar_t *>(buf.get() + prop->LogFileNameOffset);
             auto const err = wcscpy_s(file_dst, MAX_LOGFILE_PATH_LEN, file_src.c_str());
@@ -557,7 +577,7 @@ void wmain()
                 std::wcerr << L"ERROR in wcscpy_s: " << std::dec << err << std::endl;
                 std::abort();
             }
-            std::wcout << L"use file: " << file_src << std::endl;
+            std::wcout << L"use circular file: " << file_src << std::endl;
         }
 
         if (code = StartTraceW(&th, name, prop), ERROR_SUCCESS != code)
@@ -617,12 +637,26 @@ void wmain()
 
         for (size_t n = 0; n < providers_count; ++n)
         {
-            std::wcout << L"get_provider_guid #" << std::dec << n  << std::endl;
-            auto const & recovered_provider_guid = get_provider_guid(rhs[n]);
-            std::wcout << L"provider_guid #" << std::dec << n  << L": " << recovered_provider_guid << std::endl;
-            if (!IsEqualGUID(recovered_provider_guid, *providers[n].guid))
+            std::wcout << L"get_provider_info #" << std::dec << n  << std::endl;
+            GUID const * provider_guid;
+            PVOID callback;
+            PVOID context;
+            get_provider_info(rhs[n], provider_guid, callback, context);
+            std::wcout << L"provider_guid #" << std::dec << n  << L": " << *provider_guid << L" "
+                << std::hex << std::setw(2 * sizeof (void *)) << std::setfill(L'0') << reinterpret_cast<uintptr_t>(callback) << L" "
+                << std::hex << std::setw(2 * sizeof (void *)) << std::setfill(L'0') << reinterpret_cast<uintptr_t>(context) << std::endl;
+            if (callback == providers[n].callback)
+                std::wcout << L"original callback" << std::endl;
+            else
+                std::wcout << L"proxy callback" << std::endl;
+            if (!IsEqualGUID(*provider_guid, *providers[n].guid))
             {
-                std::wcerr << L"ERROR in get_provider_guid" << std::endl;
+                std::wcerr << L"ERROR in get_provider_info:: guid" << std::endl;
+                std::abort();
+            }
+            if (context != providers[n].context)
+            {
+                std::wcerr << L"ERROR in get_provider_info: context" << std::endl;
                 std::abort();
             }
         }
